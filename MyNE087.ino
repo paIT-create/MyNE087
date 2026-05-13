@@ -111,7 +111,7 @@ const uint8_t anode_RED[3] = { 6, 3, 10 };
 const uint8_t dsResolution = 12;
 
 const unsigned long FSM_TICK_MS = 7500;
-const unsigned long LDR_MS = 500;
+const unsigned long LDR_MS = 100;
 const unsigned long RESCAN_MS = 3000;
 
 // W trybie przypisywania skanujemy częściej, bo user robi czynności "tu i teraz".
@@ -126,12 +126,12 @@ const uint8_t WARMUP_SAMPLES = 2;  // po błędzie odrzuć pierwsze próbki
 const uint8_t FAILS_TO_ERROR = 3;  // ile błędów z rzędu uznać za stan błędu
 
 // Kalibracja mapowania LDR->PWM (dopasuj do własnego zakresu LDR w obudowie)
-long ldrInMin = 200;  // MIN 200  // przesuniecie granicy w celu wczesniejszego wlaczenia maksymalnej jasnosci
-long ldrInMax = 1123; // MAX 1023 // przesuniecie granicy w celu podniesienia minimalnej jasności w ciemnym pomieszczeniu
-
+long ldrInMin = 220;                      // MIN 220 [0]    przesuniecie granicy w celu wczesniejszego wlaczenia maksymalnej jasnosci
+long ldrInMax = 990;                      // MAX 990 [1023] przesuniecie granicy w celu podniesienia minimalnej jasności w ciemnym pomieszczeniu
+volatile uint8_t systemBrightness = 128;  // Aktualna jasność globalna (0-255)
 // Kompensacja jasności czerwonego.
-// Jeśli czerwony świeci mocniej/słabiej niż zielony, można to wyrównać ditheringiem w ISR.
-const uint8_t RED_LEVEL = 100;  // 0–255
+// Jeśli czerwony świeci mocniej niż zielony, można to wyrównać w ISR.
+const uint8_t RED_LEVEL = 67;  // 0–255
 
 /* ===================== SEGMENTY =====================
    Mapa segmentów dla cyfr 0..9 w standardowym układzie 7-seg.
@@ -298,14 +298,31 @@ uint8_t assignStable = 0;
  *  LOW LEVEL: 74HC595 + ANODY
  * ========================================================================================= */
 
+// void write595(uint8_t v) {
+//   // Shift register aktualizujemy w 3 krokach:
+//   // - latch LOW: odłącz wyjścia od rejestru przesuwnego,
+//   // - shiftOut: wprowadź bity,
+//   // - latch HIGH: "zatrzaśnij" nowy stan na wyjściach.
+//   digitalWrite(latchPin, LOW);
+//   shiftOut(dataPin, clockPin, MSBFIRST, v);
+//   digitalWrite(latchPin, HIGH);
+// }
 void write595(uint8_t v) {
-  // Shift register aktualizujemy w 3 krokach:
-  // - latch LOW: odłącz wyjścia od rejestru przesuwnego,
-  // - shiftOut: wprowadź bity,
-  // - latch HIGH: "zatrzaśnij" nowy stan na wyjściach.
-  digitalWrite(latchPin, LOW);
-  shiftOut(dataPin, clockPin, MSBFIRST, v);
-  digitalWrite(latchPin, HIGH);
+  // Pętla wysyłająca 8 bitów zoptymalizowana bezpośrednio pod Port B
+  for (uint8_t i = 0; i < 8; i++) {
+    if (v & 0x80) {
+      PORTB |= (1 << PB0);  // dataPin (8) -> HIGH
+    } else {
+      PORTB &= ~(1 << PB0);  // dataPin (8) -> LOW
+    }
+
+    PORTB |= (1 << PB5);   // clockPin (13) -> HIGH (zbocze narastające)
+    v <<= 1;               // Przesunięcie do kolejnego bitu
+    PORTB &= ~(1 << PB5);  // clockPin (13) -> LOW
+  }
+
+  PORTB |= (1 << PB4);   // latchPin (12) -> HIGH (zatrzaśnięcie danych)
+  PORTB &= ~(1 << PB4);  // latchPin (12) -> LOW
 }
 
 void setSegments(char c) {
@@ -740,18 +757,18 @@ void updateSensor(uint8_t i) {
 // bo ISR renderuje flow bezpośrednio (na podstawie flowPos i stanu ASSIGN).
 // Zostaje jako przykład alternatywy: "przygotuj bufor i przełącz".
 
-volatile uint8_t flowDigit = 0;
+// volatile uint8_t flowDigit = 0;
 
-void commitAssignFlow() {
-  uint8_t b = 1 - activeBuf;
-  displayBuf[b][0] = ' ';
-  displayBuf[b][1] = ' ';
-  displayBuf[b][2] = ' ';
-  displayBuf[b][flowDigit] = '-';
-  noInterrupts();
-  activeBuf = b;
-  interrupts();
-}
+// void commitAssignFlow() {
+//   uint8_t b = 1 - activeBuf;
+//   displayBuf[b][0] = ' ';
+//   displayBuf[b][1] = ' ';
+//   displayBuf[b][2] = ' ';
+//   displayBuf[b][flowDigit] = '-';
+//   noInterrupts();
+//   activeBuf = b;
+//   interrupts();
+// }
 
 /* =========================================================================================
  *  FSM: NORMAL MODE
@@ -1060,71 +1077,41 @@ ISR(TIMER2_COMPA_vect) {
   }
 
   // 3) Zapal anodę właściwego koloru
+  // --- SPRZĘTOWY WYBÓR KOLORU I KOREKTA JASNOŚCI W ISR ---
+  uint8_t activeColor = 0;  // 0 = Zielony, 1 = Czerwony
+
   if (blinkCount) {
-    if (blinkOn) {
-      for (uint8_t i = 0; i < 3; i++) {
-        if (blinkMode == BLINK_SOLID) {
-          if (blinkColor == 0) digitalWrite(anode_GREEN[i], LOW);
-          else digitalWrite(anode_RED[i], LOW);
-        } else {
-          // BLINK_SEQUENCE: blinkPhase zmienia kolor co "mignięcie"
-          bool green = (blinkPhase % 2 == 0);
-          if (green) digitalWrite(anode_GREEN[i], LOW);
-          else digitalWrite(anode_RED[i], LOW);
-        }
-      }
-    }
-    // W trybie blink nie multiplexujemy "normalnie" — pokazujemy pełne --- na wszystkich.
-    // (Anody są włączane w pętli powyżej.)
-    return;
+    activeColor = (blinkMode == BLINK_SOLID) ? blinkColor : (blinkPhase % 2);
+  } else if (fsmState == FSM_STARTUP) {
+    activeColor = g ? 0 : 1;
+  } else if (isAssign) {
+    activeColor = (fsmState == FSM_ASSIGN_A || fsmState == FSM_ASSIGN_A_REMOVE || fsmState == FSM_ASSIGN_SAVE) ? 0 : 1;
+  } else {
+    activeColor = (fsmState == FSM_SHOW_A || fsmState == FSM_ERR_A) ? 0 : 1;
   }
 
-  if (fsmState == FSM_STARTUP) {
-    // STARTUP: naprzemiennie kolorami, cyfra po cyfrze w multiplexie.
-    digitalWrite(g ? anode_GREEN[d] : anode_RED[d], LOW);
-  } else if (isAssign) {
-    // ASSIGN:
-    // - ASSIGN A / REMOVE / SAVE => zielony
-    // - ASSIGN B / REMOVE        => czerwony
-    bool greenAssign =
-      (fsmState == FSM_ASSIGN_A) || (fsmState == FSM_ASSIGN_A_REMOVE) || (fsmState == FSM_ASSIGN_SAVE);
+  // Sterowanie sprzętowym rejestrem Timer1 (Wysoka wartość = Ciemniejszy ekran)
+  if (activeColor == 1) {
+    // KOREKTA DLA CZERWONEGO:
+    // Przeliczamy systemBrightness na postać "aktywnej intensywności świecenia" (255 - systemBrightness),
+    // skalujemy ją współczynnikiem RED_LEVEL, a następnie odwracamy z powrotem do logiki rejestru OCR1A.
+    uint8_t activeIntensity = 255 - systemBrightness;
+    uint8_t scaledIntensity = ((uint16_t)activeIntensity * RED_LEVEL) >> 8;
 
-    if (greenAssign) {
-      digitalWrite(anode_GREEN[d], LOW);
-    } else {
-      // Dithering czerwonego — identyczny mechanizm jak w normalnym SHOW_B.
-      static uint16_t redAcc = 0;
-      static bool redOnThisFrame = true;
+    OCR1A = 255 - scaledIntensity;
+  } else {
+    // KOREKTA DLA ZIELONEGO:
+    // Zielony pobiera bezpośrednią, wyliczoną w pętli loop wartość tłumienia
+    OCR1A = systemBrightness;
+  }
 
-      if (d == 0) {
-        redAcc += RED_LEVEL;
-        if (redAcc >= 255) {
-          redAcc -= 255;
-          redOnThisFrame = true;
-        } else {
-          redOnThisFrame = false;
-        }
-      }
-      if (redOnThisFrame) digitalWrite(anode_RED[d], LOW);
-    }
-  } else if (fsmState == FSM_SHOW_A || fsmState == FSM_ERR_A) {
-    // Kanał A zawsze zielony.
+  // --- 4) Fizyczne załączenie właściwej anody ---
+  if (blinkCount && !blinkOn) return;  // Wygaszenie w fazie OFF blinku
+
+  if (activeColor == 0) {
     digitalWrite(anode_GREEN[d], LOW);
   } else {
-    // Kanał B zawsze czerwony z ditheringiem.
-    static uint16_t redAcc = 0;
-    static bool redOnThisFrame = true;
-
-    if (d == 0) {
-      redAcc += RED_LEVEL;
-      if (redAcc >= 255) {
-        redAcc -= 255;
-        redOnThisFrame = true;
-      } else {
-        redOnThisFrame = false;
-      }
-    }
-    if (redOnThisFrame) digitalWrite(anode_RED[d], LOW);
+    digitalWrite(anode_RED[d], LOW);
   }
 
   // Następna cyfra.
@@ -1136,10 +1123,21 @@ ISR(TIMER2_COMPA_vect) {
  * ========================================================================================= */
 
 void setup() {
+  //Serial.begin(115200);
   // PWM na Timer1 (pin 9/10 w ATmega328P zależy od płytki).
   // Preskaler zmieniasz po to, by dopasować częstotliwość PWM do tego,
   // żeby OE nie powodowało słyszalnych/wyczuwalnych artefaktów.
-  TCCR1B = (TCCR1B & 0xF8) | 0x02;
+  // TCCR1B = (TCCR1B & 0xF8) | 0x02;
+
+  // --- KONFIGURACJA SPRZĘTOWA TIMER1 DLA PINU 9 (OE) ---
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+  // Tryb Fast PWM 8-bit, czyszczenie OC1A przy dopasowaniu (Clear on Compare Match)
+  TCCR1A |= (1 << COM1A1) | (1 << WGM10);  // Standardowy Fast PWM 8-bit (bez COM1A0!)
+  TCCR1B |= (1 << WGM12) | (1 << CS11);    // Preskaler 8 -> f = 16MHz / (8 * 256) = 7.812 kHz
+
+  OCR1A = 0;  // 0 = stan niski na OE przez 100% czasu = maksymalna jasność startowa
 
   pinMode(latchPin, OUTPUT);
   pinMode(dataPin, OUTPUT);
@@ -1194,15 +1192,27 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // --- Jasność zależna od LDR ---
-  if (now - lastLdrTick >= LDR_MS) {
+  // --- Jasność zależna od LDR (Wysoki odczyt = Ciemność) ---
+  if (now - lastLdrTick >= LDR_MS) {  // LDR_MS = 100 dla szybszej reakcji
     int raw = analogRead(ldrPin);
 
-    // Mapowanie raw->PWM:
-    // - constrain na 0..254 (255 bywa "specjalne" w zależności od konfiguracji PWM),
-    // - map() bez float, wystarcza.
-    int pwm = constrain(map(raw, ldrInMin, ldrInMax, 0, 254), 0, 254);
-    analogWrite(oePin, pwm);
+    // Diagnostyka na Serial Monitor (raz na sekundę)
+    // static uint8_t serialDivider = 0;
+    // if (++serialDivider >= 10) {
+    //   serialDivider = 0;
+    //   Serial.print(F("LDR Raw: "));
+    //   Serial.print(raw);
+    //   Serial.print(F(" | PWM Out: "));
+    //   Serial.println(systemBrightness);
+    // }
+
+    // MAPOWANIE DIRECT DLA WYSOKIEGO STANU OE:
+    // raw blisko ldrInMin (Jasno) -> 5   (Krótki stan HIGH na OE = Max jasność)
+    // raw blisko ldrInMax (Ciemno) -> 240 (Długi stan HIGH na OE = Ekran mocno wygaszony)
+    int targetPwm = constrain(map(raw, ldrInMin, ldrInMax, 0, 250), 0, 250);
+
+    // Filtr dolnoprzepustowy wygładzający zmiany
+    systemBrightness = (uint8_t)((systemBrightness * 7 + targetPwm) >> 3);
 
     lastLdrTick = now;
   }
