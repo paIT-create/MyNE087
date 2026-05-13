@@ -6,18 +6,17 @@
  *  - 2 kolory wyświetlania na 3-cyfrowym 7-seg (zielony / czerwony).
  *  - Naprzemienne pokazywanie temperatur A i B (z priorytetem na działający czujnik).
  *  - Wysoka odporność na hot-plug (odłączanie/podłączanie czujników w locie).
- *  - Trwałe mapowanie "który ROM jest A, który jest B" w zewnętrznej EEPROM I2C.
+ *  - Trwałe mapowanie "który ROM jest A, który jest B" w EEPROM.
  *
  *  Kluczowe idee architektury:
  *  1) ISR (Timer2) robi tylko to, co musi być deterministyczne czasowo:
  *     - multiplex 3 cyfr,
  *     - wybór koloru,
  *     - proste animacje (blink / flow),
- *     - dithering jasności czerwonego (kompensacja różnicy jasności LED).
+ *     - kompensacja jasności koloru czerwonego.
  *
  *     ISR nie:
  *     - czyta czujników,
- *     - nie używa I2C,
  *     - nie liczy średnich,
  *     - nie formatuje temperatur (poza DP).
  *
@@ -33,7 +32,6 @@
  *
  *  4) EEPROM trzyma mapę ROM->kanał:
  *     - magic/version/CRC, żeby wykryć śmieci/niezgodne dane,
- *     - zapis blokowy z podziałem na strony (page write), żeby nie zawijało adresów.
  *
  *  Tryb przypisywania (ASSIGN):
  *  - Start BEZ czujników => urządzenie wchodzi w procedurę mapowania:
@@ -41,14 +39,11 @@
  *    ASSIGN B (czerwony flow) -> wykryj stabilnie 1 czujnik -> zapamiętaj jako B -> poproś o odłączenie
  *    SAVE -> zapis do EEPROM -> przejście do normalnej pracy
  *
- *  Uwaga o adresie EEPROM:
- *  - 24C01/24FC01: bazowo 0x50 + bity A2..A0
- *  - u Ciebie: A0=1, A1=1, A2=0 => 0x53
  *******************************************************************************************/
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <Wire.h>
+#include <EEPROM.h>  // Wbudowana biblioteka AVR
 
 /* ===================== PINY / POŁĄCZENIA =====================
 
@@ -74,19 +69,9 @@
 const uint8_t anode_GREEN[3] = { 5, 7, 11 };
 const uint8_t anode_RED[3] = { 6, 3, 10 };
 
-/* ===================== EEPROM I2C =====================
-
-   24C01 = 1 Kbit = 128 bajtów adresowania.
-
-   Ważny detal praktyczny:
-   Wiele małych EEPROM ma page-write np. 8 bajtów.
-   Jeśli wyślesz więcej bajtów niż rozmiar strony, układ może "zawinąć" adres w obrębie strony.
-   Dlatego zapis bloku dzielimy na bezpieczne kawałki, pilnując granic stron.
-*/
-
-#define EEPROM_I2C_ADDR 0x53
-#define EEPROM_SIZE_BYTES 128
-#define EEPROM_PAGE_SIZE 8
+// ===================== EEPROM =====================
+// Definiujemy stały adres startowy w pamięci wewnętrznej (np. początek pamięci)
+const int INTERNAL_EEPROM_START_ADDR = 0;
 
 /* ===================== PARAMETRY LOGIKI / CZASU =====================
 
@@ -103,9 +88,9 @@ const uint8_t anode_RED[3] = { 6, 3, 10 };
    - co 3 s sprawdzamy magistralę (hot-plug),
    - ale nie robimy tego co pętlę, żeby nie obciążać OneWire i nie ryzykować glitchy.
 
-   LDR_MS = 500:
+   LDR_MS = 100:
    - jasność nie musi być super szybka,
-   - pół sekundy daje płynne wrażenie i ogranicza szum od ADC.
+   - dzięki filtrowi IIR (7:1) daje płynne wrażenie i ogranicza szum od ADC.
 */
 
 const uint8_t dsResolution = 12;
@@ -131,7 +116,7 @@ long ldrInMax = 990;                      // MAX 990 [1023] przesuniecie granicy
 volatile uint8_t systemBrightness = 128;  // Aktualna jasność globalna (0-255)
 // Kompensacja jasności czerwonego.
 // Jeśli czerwony świeci mocniej niż zielony, można to wyrównać w ISR.
-const uint8_t RED_LEVEL = 67;  // 0–255
+const uint8_t RED_LEVEL = 60;  // 0–255
 
 /* ===================== SEGMENTY =====================
    Mapa segmentów dla cyfr 0..9 w standardowym układzie 7-seg.
@@ -298,15 +283,6 @@ uint8_t assignStable = 0;
  *  LOW LEVEL: 74HC595 + ANODY
  * ========================================================================================= */
 
-// void write595(uint8_t v) {
-//   // Shift register aktualizujemy w 3 krokach:
-//   // - latch LOW: odłącz wyjścia od rejestru przesuwnego,
-//   // - shiftOut: wprowadź bity,
-//   // - latch HIGH: "zatrzaśnij" nowy stan na wyjściach.
-//   digitalWrite(latchPin, LOW);
-//   shiftOut(dataPin, clockPin, MSBFIRST, v);
-//   digitalWrite(latchPin, HIGH);
-// }
 void write595(uint8_t v) {
   // Pętla wysyłająca 8 bitów zoptymalizowana bezpośrednio pod Port B
   for (uint8_t i = 0; i < 8; i++) {
@@ -478,78 +454,6 @@ void pushAvg(uint8_t i, float v) {
 }
 
 /* =========================================================================================
- *  EEPROM LOW LEVEL (I2C)
- * ========================================================================================= */
-
-static bool eepromWaitReady(uint16_t timeoutMs = 50) {
-  // EEPROM po zapisie wewnętrznie programuje komórki.
-  // W tym czasie nie odpowiada ACK na adres.
-  // Typowy wzorzec: polling aż do ACK.
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    Wire.beginTransmission(EEPROM_I2C_ADDR);
-    uint8_t rc = Wire.endTransmission();
-    if (rc == 0) return true;
-    delay(1);
-  }
-  return false;
-}
-
-static bool eepromWriteByte(uint8_t memAddr, uint8_t val) {
-  Wire.beginTransmission(EEPROM_I2C_ADDR);
-  Wire.write(memAddr);
-  Wire.write(val);
-  if (Wire.endTransmission() != 0) return false;
-  return eepromWaitReady();
-}
-
-static bool eepromReadByte(uint8_t memAddr, uint8_t& val) {
-  // Wzorzec losowego odczytu:
-  // 1) write address (bez stop -> repeated start),
-  // 2) requestFrom.
-  Wire.beginTransmission(EEPROM_I2C_ADDR);
-  Wire.write(memAddr);
-  if (Wire.endTransmission(false) != 0) return false;
-
-  uint8_t n = Wire.requestFrom((uint8_t)EEPROM_I2C_ADDR, (uint8_t)1);
-  if (n != 1) return false;
-  val = Wire.read();
-  return true;
-}
-
-static bool eepromWriteBlock(uint8_t memAddr, const uint8_t* data, uint8_t len) {
-  // Zapis blokowy z podziałem na strony.
-  // Dzięki temu unikamy zawinięcia wewnątrz strony (page-write wrap).
-  while (len) {
-    uint8_t pageOff = memAddr % EEPROM_PAGE_SIZE;
-    uint8_t chunk = min((uint8_t)(EEPROM_PAGE_SIZE - pageOff), len);
-
-    Wire.beginTransmission(EEPROM_I2C_ADDR);
-    Wire.write(memAddr);
-    for (uint8_t i = 0; i < chunk; i++) Wire.write(data[i]);
-    if (Wire.endTransmission() != 0) return false;
-    if (!eepromWaitReady()) return false;
-
-    memAddr += chunk;
-    data += chunk;
-    len -= chunk;
-  }
-  return true;
-}
-
-static bool eepromReadBlock(uint8_t memAddr, uint8_t* data, uint8_t len) {
-  Wire.beginTransmission(EEPROM_I2C_ADDR);
-  Wire.write(memAddr);
-  if (Wire.endTransmission(false) != 0) return false;
-
-  uint8_t got = Wire.requestFrom((uint8_t)EEPROM_I2C_ADDR, (uint8_t)len);
-  if (got != len) return false;
-
-  for (uint8_t i = 0; i < len; i++) data[i] = Wire.read();
-  return true;
-}
-
-/* =========================================================================================
  *  EEPROM MAP STRUCT (MAGIC / VERSION / CRC)
  * ========================================================================================= */
 
@@ -569,18 +473,16 @@ static uint8_t crcXor(const uint8_t* p, uint8_t n) {
 
 bool loadMapFromEEPROM() {
   EepromMap m;
-  if (sizeof(m) > EEPROM_SIZE_BYTES) return false;
 
-  if (!eepromReadBlock(0, (uint8_t*)&m, sizeof(m))) return false;
+  // Odczyt całej struktury za jednym zamachem z wewnętrznej pamięci
+  EEPROM.get(INTERNAL_EEPROM_START_ADDR, m);
 
-  // Magic + version to szybkie sito na "śmieci" (np. świeża EEPROM = 0xFF)
+  // Walidacja danych (Magic + Wersja + CRC)
   if (m.magic != 0xA55A) return false;
   if (m.version != 1) return false;
+  if (crcXor((uint8_t*)&m, sizeof(m) - 1) != m.crc) return false;
 
-  // CRC kończy temat: jeśli nie pasuje -> nie ufamy mapie.
-  uint8_t calc = crcXor((uint8_t*)&m, sizeof(m) - 1);
-  if (calc != m.crc) return false;
-
+  // Jeśli dane poprawne, przepisz do pamięci RAM urządzenia
   memcpy(savedA, m.addrA, 8);
   memcpy(savedB, m.addrB, 8);
   return true;
@@ -594,7 +496,11 @@ bool saveMapToEEPROM(const DeviceAddress a, const DeviceAddress b) {
   memcpy(m.addrB, b, 8);
   m.crc = crcXor((uint8_t*)&m, sizeof(m) - 1);
 
-  return eepromWriteBlock(0, (uint8_t*)&m, sizeof(m));
+  // Zapis całej struktury. Co ważne: funkcja put() używa wewnętrznie mechanizmu "update",
+  // czyli fizycznie zapisuje komórkę tylko wtedy, gdy nowa wartość różni się od starej.
+  // Drastycznie wydłuża to żywotność pamięci EEPROM mikrokontrolera!
+  EEPROM.put(INTERNAL_EEPROM_START_ADDR, m);
+  return true;
 }
 
 /* =========================================================================================
@@ -750,107 +656,9 @@ void updateSensor(uint8_t i) {
 }
 
 /* =========================================================================================
- *  ASSIGN DISPLAY: FLOW
- * ========================================================================================= */
-
-// Uwaga: commitAssignFlow() w tej wersji nie jest używany przez ISR,
-// bo ISR renderuje flow bezpośrednio (na podstawie flowPos i stanu ASSIGN).
-// Zostaje jako przykład alternatywy: "przygotuj bufor i przełącz".
-
-// volatile uint8_t flowDigit = 0;
-
-// void commitAssignFlow() {
-//   uint8_t b = 1 - activeBuf;
-//   displayBuf[b][0] = ' ';
-//   displayBuf[b][1] = ' ';
-//   displayBuf[b][2] = ' ';
-//   displayBuf[b][flowDigit] = '-';
-//   noInterrupts();
-//   activeBuf = b;
-//   interrupts();
-// }
-
-/* =========================================================================================
  *  FSM: NORMAL MODE
  * ========================================================================================= */
 
-// void fsmStepNormal() {
-//   // Zaczynamy od rozpoczęcia konwersji temperatur — non-blocking.
-//   sensors.requestTemperatures();
-
-//   // Aktualizujemy oba kanały: każdy sam zarządza fails/warmup/avg.
-//   updateSensor(0);
-//   updateSensor(1);
-
-//   bool aOK = (s[0].fails < FAILS_TO_ERROR) && addrValid[0];
-//   bool bOK = (s[1].fails < FAILS_TO_ERROR) && addrValid[1];
-
-//   // anyGood: czy w ogóle mamy jakiś sensowny wynik do pokazania.
-//   bool anyGood = (!isnan(s[0].avg) && aOK) || (!isnan(s[1].avg) && bOK);
-
-//   if (!anyGood) {
-//     // Jeśli nic nie ma sensownego, próbujemy przynajmniej pokazać to, co działa.
-//     // Logika "preferencyjna" chroni UX przed ciągłym --- gdy jeden czujnik żyje.
-//     if (!aOK && bOK) {
-//       fsmState = FSM_SHOW_B;
-//       commitTemp(s[1].avg);
-//       return;
-//     }
-//     if (!bOK && aOK) {
-//       fsmState = FSM_SHOW_A;
-//       commitTemp(s[0].avg);
-//       return;
-//     }
-
-//     // Jeśli oba martwe -> STARTUP jako stan "nie wiem co jest na magistrali".
-//     fsmState = FSM_STARTUP;
-//     commit(fillG);
-//     return;
-//   }
-
-//   // Wyjście ze STARTUP:
-//   // STARTUP to stan "nie wyświetlam temperatur, bo jeszcze nie wiem co działa".
-//   // Jeśli już wiem, wybieram pierwszy dostępny kanał.
-//   if (fsmState == FSM_STARTUP) {
-//     if (aOK) fsmState = FSM_SHOW_A;
-//     else if (bOK) fsmState = FSM_SHOW_B;
-
-//     // commit(fillG) to krótkie "przecięcie" między trybami.
-//     // Nie jest konieczne funkcjonalnie, ale UX-owo daje czytelne przejście.
-//     commit(fillG);
-//     return;
-//   }
-
-//   // NORMALNA PRACA: naprzemienność z priorytetem na sprawny kanał.
-//   if (nextIsA) {
-//     if (aOK) fsmState = FSM_SHOW_A;
-//     else if (bOK) fsmState = FSM_SHOW_B;
-//   } else {
-//     if (bOK) fsmState = FSM_SHOW_B;
-//     else if (aOK) fsmState = FSM_SHOW_A;
-//   }
-//   nextIsA = !nextIsA;
-
-//   // Finalnie: jeśli wybrany kanał nie ma sensownych danych -> pokaż błąd kanału,
-//   // w przeciwnym razie sformatuj i wyświetl temperaturę.
-//   if (fsmState == FSM_SHOW_A) {
-//     if (!aOK || isnan(s[0].avg)) {
-//       fsmState = FSM_ERR_A;
-//       commit(fillG);
-//     } else {
-//       commitTemp(s[0].avg);
-//     }
-//   } else if (fsmState == FSM_SHOW_B) {
-//     if (!bOK || isnan(s[1].avg)) {
-//       fsmState = FSM_ERR_B;
-//       commit(fillG);
-//     } else {
-//       commitTemp(s[1].avg);
-//     }
-//   } else {
-//     commit(fillG);
-//   }
-// }
 void fsmStepNormal() {
   // Sprawdzamy statusy czujników na bazie danych zebranych w loop()
   bool aOK = (s[0].fails < FAILS_TO_ERROR) && addrValid[0];
@@ -1048,9 +856,9 @@ void fsmStep() {
  *  W ISR przełączamy cyfrę co 1 ms:
  *  - 3 cyfry => ~333 Hz odświeżania każdej cyfry (flicker-free).
  *
- *  Dithering czerwonego:
+ *  Korekta jasności czerwonego:
  *  - czerwony może mieć inną jasność niż zielony.
- *  - Robimy prosty "frame skipping": w niektórych ramkach czerwony nie świeci.
+ *  - Robimy krekcję bezpośrednio dla PWM OE wykorzuystując filtr IIR (7:1) w loop().
  */
 
 ISR(TIMER2_COMPA_vect) {
@@ -1186,20 +994,27 @@ ISR(TIMER2_COMPA_vect) {
 
 void setup() {
   //Serial.begin(115200);
+
   // PWM na Timer1 (pin 9/10 w ATmega328P zależy od płytki).
   // Preskaler zmieniasz po to, by dopasować częstotliwość PWM do tego,
   // żeby OE nie powodowało słyszalnych/wyczuwalnych artefaktów.
-  // TCCR1B = (TCCR1B & 0xF8) | 0x02;
 
-  // --- KONFIGURACJA SPRZĘTOWA TIMER1 DLA PINU 9 (OE) ---
+  // --- UNIWERSALNA KONFIGURACJA SPRZĘTOWA TIMER1 (328P / 328PB) ---
+#if defined(__AVR_ATmega328PB__)
+  // Specyficzne dla wersji PB: upewniamy się, że Timer1 nie jest w stanie uśpienia (Power Reduction)
+  PRR0 &= ~(1 << PRTIM1);
+// W wersji PB wyłączamy alternatywne mapowanie, wymuszając powiązanie OC1A z pinem PB1 (9)
+#if defined(TC1_MAP_REMAP)
+  SYSTEM_REG_REMOVE_WRITE_PROTECTION;
+  TC1_MAP_REG &= ~TC1_MAP_REMAP;
+#endif
+#endif
+
   TCCR1A = 0;
   TCCR1B = 0;
-
-  // Tryb Fast PWM 8-bit, czyszczenie OC1A przy dopasowaniu (Clear on Compare Match)
-  TCCR1A |= (1 << COM1A1) | (1 << WGM10);  // Standardowy Fast PWM 8-bit (bez COM1A0!)
-  TCCR1B |= (1 << WGM12) | (1 << CS11);    // Preskaler 8 -> f = 16MHz / (8 * 256) = 7.812 kHz
-
-  OCR1A = 0;  // 0 = stan niski na OE przez 100% czasu = maksymalna jasność startowa
+  TCCR1A |= (1 << COM1A1) | (1 << WGM10);  // Standardowy Fast PWM 8-bit
+  TCCR1B |= (1 << WGM12) | (1 << CS11);    // Preskaler 8 -> f = 7.812 kHz
+  OCR1A = 0;                               // Start od wypełnienia 0%
 
   pinMode(latchPin, OUTPUT);
   pinMode(dataPin, OUTPUT);
@@ -1216,8 +1031,6 @@ void setup() {
   // Bufory startowo w stanie błędu/blanku.
   fillG(displayBuf[0]);
   fillG(displayBuf[1]);
-
-  Wire.begin();
 
   // Spróbuj wczytać mapę (jeśli nie ma/CRC nie pasuje -> eepromMapValid=false).
   eepromMapValid = loadMapFromEEPROM();
