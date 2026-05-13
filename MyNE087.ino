@@ -774,23 +774,93 @@ void updateSensor(uint8_t i) {
  *  FSM: NORMAL MODE
  * ========================================================================================= */
 
+// void fsmStepNormal() {
+//   // Zaczynamy od rozpoczęcia konwersji temperatur — non-blocking.
+//   sensors.requestTemperatures();
+
+//   // Aktualizujemy oba kanały: każdy sam zarządza fails/warmup/avg.
+//   updateSensor(0);
+//   updateSensor(1);
+
+//   bool aOK = (s[0].fails < FAILS_TO_ERROR) && addrValid[0];
+//   bool bOK = (s[1].fails < FAILS_TO_ERROR) && addrValid[1];
+
+//   // anyGood: czy w ogóle mamy jakiś sensowny wynik do pokazania.
+//   bool anyGood = (!isnan(s[0].avg) && aOK) || (!isnan(s[1].avg) && bOK);
+
+//   if (!anyGood) {
+//     // Jeśli nic nie ma sensownego, próbujemy przynajmniej pokazać to, co działa.
+//     // Logika "preferencyjna" chroni UX przed ciągłym --- gdy jeden czujnik żyje.
+//     if (!aOK && bOK) {
+//       fsmState = FSM_SHOW_B;
+//       commitTemp(s[1].avg);
+//       return;
+//     }
+//     if (!bOK && aOK) {
+//       fsmState = FSM_SHOW_A;
+//       commitTemp(s[0].avg);
+//       return;
+//     }
+
+//     // Jeśli oba martwe -> STARTUP jako stan "nie wiem co jest na magistrali".
+//     fsmState = FSM_STARTUP;
+//     commit(fillG);
+//     return;
+//   }
+
+//   // Wyjście ze STARTUP:
+//   // STARTUP to stan "nie wyświetlam temperatur, bo jeszcze nie wiem co działa".
+//   // Jeśli już wiem, wybieram pierwszy dostępny kanał.
+//   if (fsmState == FSM_STARTUP) {
+//     if (aOK) fsmState = FSM_SHOW_A;
+//     else if (bOK) fsmState = FSM_SHOW_B;
+
+//     // commit(fillG) to krótkie "przecięcie" między trybami.
+//     // Nie jest konieczne funkcjonalnie, ale UX-owo daje czytelne przejście.
+//     commit(fillG);
+//     return;
+//   }
+
+//   // NORMALNA PRACA: naprzemienność z priorytetem na sprawny kanał.
+//   if (nextIsA) {
+//     if (aOK) fsmState = FSM_SHOW_A;
+//     else if (bOK) fsmState = FSM_SHOW_B;
+//   } else {
+//     if (bOK) fsmState = FSM_SHOW_B;
+//     else if (aOK) fsmState = FSM_SHOW_A;
+//   }
+//   nextIsA = !nextIsA;
+
+//   // Finalnie: jeśli wybrany kanał nie ma sensownych danych -> pokaż błąd kanału,
+//   // w przeciwnym razie sformatuj i wyświetl temperaturę.
+//   if (fsmState == FSM_SHOW_A) {
+//     if (!aOK || isnan(s[0].avg)) {
+//       fsmState = FSM_ERR_A;
+//       commit(fillG);
+//     } else {
+//       commitTemp(s[0].avg);
+//     }
+//   } else if (fsmState == FSM_SHOW_B) {
+//     if (!bOK || isnan(s[1].avg)) {
+//       fsmState = FSM_ERR_B;
+//       commit(fillG);
+//     } else {
+//       commitTemp(s[1].avg);
+//     }
+//   } else {
+//     commit(fillG);
+//   }
+// }
 void fsmStepNormal() {
-  // Zaczynamy od rozpoczęcia konwersji temperatur — non-blocking.
-  sensors.requestTemperatures();
-
-  // Aktualizujemy oba kanały: każdy sam zarządza fails/warmup/avg.
-  updateSensor(0);
-  updateSensor(1);
-
+  // Sprawdzamy statusy czujników na bazie danych zebranych w loop()
   bool aOK = (s[0].fails < FAILS_TO_ERROR) && addrValid[0];
   bool bOK = (s[1].fails < FAILS_TO_ERROR) && addrValid[1];
 
-  // anyGood: czy w ogóle mamy jakiś sensowny wynik do pokazania.
+  // Czy którykolwiek kanał ma poprawną, przefiltrowaną średnią?
   bool anyGood = (!isnan(s[0].avg) && aOK) || (!isnan(s[1].avg) && bOK);
 
   if (!anyGood) {
-    // Jeśli nic nie ma sensownego, próbujemy przynajmniej pokazać to, co działa.
-    // Logika "preferencyjna" chroni UX przed ciągłym --- gdy jeden czujnik żyje.
+    // Płynna degradacja: jeśli jeden padł, wymuś pokazywanie drugiego spranego
     if (!aOK && bOK) {
       fsmState = FSM_SHOW_B;
       commitTemp(s[1].avg);
@@ -802,37 +872,29 @@ void fsmStepNormal() {
       return;
     }
 
-    // Jeśli oba martwe -> STARTUP jako stan "nie wiem co jest na magistrali".
+    // Całkowita awaria szyny -> kreski "---"
     fsmState = FSM_STARTUP;
     commit(fillG);
     return;
   }
 
-  // Wyjście ze STARTUP:
-  // STARTUP to stan "nie wyświetlam temperatur, bo jeszcze nie wiem co działa".
-  // Jeśli już wiem, wybieram pierwszy dostępny kanał.
+  // Wyjście ze stanu STARTUP po wykryciu sprawnych czujników
   if (fsmState == FSM_STARTUP) {
     if (aOK) fsmState = FSM_SHOW_A;
     else if (bOK) fsmState = FSM_SHOW_B;
-
-    // commit(fillG) to krótkie "przecięcie" między trybami.
-    // Nie jest konieczne funkcjonalnie, ale UX-owo daje czytelne przejście.
     commit(fillG);
     return;
   }
 
-  // NORMALNA PRACA: naprzemienność z priorytetem na sprawny kanał.
+  // NAPRZEMIENNOŚĆ KANAŁÓW (Wybór wyświetlanego stanu biznesowego)
   if (nextIsA) {
-    if (aOK) fsmState = FSM_SHOW_A;
-    else if (bOK) fsmState = FSM_SHOW_B;
+    fsmState = aOK ? FSM_SHOW_A : FSM_SHOW_B;
   } else {
-    if (bOK) fsmState = FSM_SHOW_B;
-    else if (aOK) fsmState = FSM_SHOW_A;
+    fsmState = bOK ? FSM_SHOW_B : FSM_SHOW_A;
   }
   nextIsA = !nextIsA;
 
-  // Finalnie: jeśli wybrany kanał nie ma sensownych danych -> pokaż błąd kanału,
-  // w przeciwnym razie sformatuj i wyświetl temperaturę.
+  // Renderowanie danych do nieaktywnego bufora (Double Buffering)
   if (fsmState == FSM_SHOW_A) {
     if (!aOK || isnan(s[0].avg)) {
       fsmState = FSM_ERR_A;
@@ -1232,5 +1294,19 @@ void loop() {
   if (now - lastFSMTick >= FSM_TICK_MS) {
     fsmStep();
     lastFSMTick = now;
+  }
+  // --- Zadanie 4: Nieblokujący odczyt temperatur i start nowej konwersji ---
+  static unsigned long lastConversionTick = 0;
+  if (now - lastConversionTick >= 1000) {  // Wykonuj dokładnie co 1 sekundę
+    lastConversionTick = now;
+
+    // 1. Zbieramy wyniki z poprzedniej konwersji (zleconej 1s temu)
+    if (fsmState < FSM_ASSIGN_A) {  // Tylko w trybie normalnym
+      updateSensor(0);              // Aktualizacja kanału A (Fails, Warmup, Avg)
+      updateSensor(1);              // Aktualizacja kanału B (Fails, Warmup, Avg)
+    }
+
+    // 2. Natychmiast startujemy nową konwersję, która będzie gotowa za sekundę
+    sensors.requestTemperatures();
   }
 }
