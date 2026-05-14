@@ -116,7 +116,7 @@ long ldrInMax = 990;                      // MAX 990 [1023] przesuniecie granicy
 volatile uint8_t systemBrightness = 128;  // Aktualna jasność globalna (0-255)
 // Kompensacja jasności czerwonego.
 // Jeśli czerwony świeci mocniej niż zielony, można to wyrównać w ISR.
-const uint8_t RED_LEVEL = 60;  // 0–255
+const uint8_t RED_LEVEL = 52;  // 0–255
 
 /* ===================== SEGMENTY =====================
    Mapa segmentów dla cyfr 0..9 w standardowym układzie 7-seg.
@@ -652,7 +652,7 @@ void updateSensor(uint8_t i) {
 
   // TEST ONLY (zostawiam jako opcję do szybkich testów wyświetlania)
   // pushAvg(0, -9.84);
-  // pushAvg(1,  8.84);
+  // pushAvg(1, 8.84);
 }
 
 /* =========================================================================================
@@ -993,7 +993,7 @@ ISR(TIMER2_COMPA_vect) {
  * ========================================================================================= */
 
 void setup() {
-  //Serial.begin(115200);
+  // Serial.begin(115200);
 
   // PWM na Timer1 (pin 9/10 w ATmega328P zależy od płytki).
   // Preskaler zmieniasz po to, by dopasować częstotliwość PWM do tego,
