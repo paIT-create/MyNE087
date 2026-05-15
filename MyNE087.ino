@@ -111,7 +111,7 @@ const uint8_t WARMUP_SAMPLES = 2;  // po błędzie odrzuć pierwsze próbki
 const uint8_t FAILS_TO_ERROR = 3;  // ile błędów z rzędu uznać za stan błędu
 
 // Kalibracja mapowania LDR->PWM (dopasuj do własnego zakresu LDR w obudowie)
-long ldrInMin = 220;                      // MIN 220 [0]    przesuniecie granicy w celu wczesniejszego wlaczenia maksymalnej jasnosci
+long ldrInMin = 250;                      // MIN 250 [0]    przesuniecie granicy w celu wczesniejszego wlaczenia maksymalnej jasnosci
 long ldrInMax = 990;                      // MAX 990 [1023] przesuniecie granicy w celu podniesienia minimalnej jasności w ciemnym pomieszczeniu
 volatile uint8_t systemBrightness = 128;  // Aktualna jasność globalna (0-255)
 // Kompensacja jasności czerwonego.
